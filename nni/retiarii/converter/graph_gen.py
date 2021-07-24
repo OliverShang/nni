@@ -6,7 +6,7 @@ import re
 import torch
 
 from ..graph import Graph, Model, Node
-from ..nn.pytorch import InputChoice, LayerChoice, Placeholder
+from ..nn.pytorch import InputChoice, Placeholder
 from ..operation import Cell, Operation
 from ..serializer import get_init_parameters_or_fail
 from ..utils import get_importable_name
@@ -20,17 +20,17 @@ class GraphConverter:
         self.global_graph_id = 0
 
     def _add_edge_handle_source_node(self, _input, graph_inputs, ir_graph, output_remap, node_index):
-        if _input in graph_inputs:
-            idx = graph_inputs.index(_input)
-            src_node = ir_graph.input_node
-            src_node_idx = idx
-        elif _input in output_remap:
+        if _input in output_remap:
             assert output_remap[_input].kind() == 'aten::append'
             predecessor_node = output_remap[_input]
             assert predecessor_node in node_index, 'predecessor node: {}'.format(predecessor_node)
             src_node_idx = None
             src_node = node_index[predecessor_node]
             assert isinstance(src_node, Node)
+        elif _input in graph_inputs:
+            idx = graph_inputs.index(_input)
+            src_node = ir_graph.input_node
+            src_node_idx = idx
         else:
             predecessor_node = _input.node()
             assert predecessor_node in node_index, 'predecessor node: {}'.format(predecessor_node)
@@ -315,16 +315,31 @@ class GraphConverter:
                     if submodule.inputsAt(0).type().name() == 'ModuleList':
                         # handle ModuleList
                         predecessor = submodule.inputsAt(0).node()
+                        module_name_space = [submodule_name]
+                        while predecessor.inputsAt(0).debugName() != 'self':
+                            # this is for dealing with nested ModuleList. below is an example
+                            # %3 : __torch__.torch.nn.modules.container.___torch_mangle_0.ModuleList = prim::GetAttr[name="ops"](%self)
+                            # %5 : __torch__.torch.nn.modules.container.ModuleList = prim::GetAttr[name="0"](%3)
+                            # %7 : __torch__.torch.nn.modules.container.ModuleList = prim::GetAttr[name="1"](%3)
+                            # %9 : __torch__.torch.nn.modules.container.ModuleList = prim::GetAttr[name="2"](%3)
+                            # %11 : __torch__.torch.nn.modules.container.ModuleList = prim::GetAttr[name="3"](%3)
+                            # %14 : __torch__.torch.nn.modules.linear.Linear = prim::GetAttr[name="0"](%5)
+                            # %16 : __torch__.torch.nn.modules.linear.Linear = prim::GetAttr[name="1"](%5)
+                            # %state.2 : Tensor = prim::CallMethod[name="forward"](%14, %x.1) # modulelist.py:18:24
+                            # %state.4 : Tensor = prim::CallMethod[name="forward"](%16, %state.2) # modulelist.py:18:24
+                            assert predecessor.kind() == 'prim::GetAttr'
+                            module_name_space.append(predecessor.s('name'))
+                            predecessor = predecessor.inputsAt(0).node()
                         assert predecessor.kind() == 'prim::GetAttr'
                         assert predecessor.hasAttribute('name')
-                        assert predecessor.inputsAt(0).debugName() == 'self'
-                        predecessor_name = predecessor.s('name')
-                        # TODO: exchange submodule_name and predecessor_name
-                        submodule_full_name = build_full_name(module_name, [submodule_name, predecessor_name])
-                        predecessor_obj = getattr(module, predecessor_name)
-                        submodule_obj = getattr(predecessor_obj, submodule_name)
-                        subgraph, sub_m_attrs = self.convert_module(script_module._modules[predecessor_name]._modules[submodule_name],
-                                                                    submodule_obj, submodule_full_name, ir_model)
+                        module_name_space.append(predecessor.s('name'))
+                        submodule_full_name = build_full_name(module_name, list(reversed(module_name_space)))
+                        submodule_obj = module
+                        script_submodule = script_module
+                        for each_name in list(reversed(module_name_space)):
+                            submodule_obj = getattr(submodule_obj, each_name)
+                            script_submodule = script_submodule._modules[each_name]
+                        subgraph, sub_m_attrs = self.convert_module(script_submodule, submodule_obj, submodule_full_name, ir_model)
                     else:
                         raise RuntimeError('Unsupported module case: {}'.format(submodule.inputsAt(0).type().str()))
 
@@ -343,7 +358,7 @@ class GraphConverter:
                         subcell = ir_graph.add_node(submodule_full_name, submodule_type_str, sub_m_attrs)
                         if isinstance(submodule_obj, Placeholder):
                             subcell.update_label(submodule_obj.label)
-                        elif isinstance(submodule_obj, (LayerChoice, InputChoice)):
+                        elif isinstance(submodule_obj, InputChoice):
                             subcell.update_label(sub_m_attrs['label'])
                     else:
                         # Graph already created, create Cell for it
@@ -536,16 +551,6 @@ class GraphConverter:
         self.remove_unconnected_nodes(ir_graph, targeted_type='prim::GetAttr')
         self.merge_aten_slices(ir_graph)
 
-    def _handle_layerchoice(self, module):
-        choices = []
-        for cand in list(module):
-            cand_type = '__torch__.' + get_importable_name(cand.__class__)
-            choices.append({'type': cand_type, 'parameters': get_init_parameters_or_fail(cand)})
-        return {
-            'candidates': choices,
-            'label': module.label
-        }
-
     def _handle_inputchoice(self, module):
         return {
             'n_candidates': module.n_candidates,
@@ -557,7 +562,8 @@ class GraphConverter:
     def _handle_valuechoice(self, module):
         return {
             'candidates': module.candidates,
-            'label': module.label
+            'label': module.label,
+            'accessor': module._accessor
         }
 
     def convert_module(self, script_module, module, module_name, ir_model):
@@ -590,7 +596,13 @@ class GraphConverter:
         if original_type_name in MODULE_EXCEPT_LIST:
             pass  # do nothing
         elif original_type_name == OpTypeName.LayerChoice:
-            m_attrs = self._handle_layerchoice(module)
+            graph = Graph(ir_model, -100, module_name, _internal=True)  # graph_id is not used now
+            candidate_name_list = [f'layerchoice_{module.label}_{cand_name}' for cand_name in module.names]
+            for cand_name, cand in zip(candidate_name_list, module):
+                cand_type = '__torch__.' + get_importable_name(cand.__class__)
+                graph.add_node(cand_name, cand_type, get_init_parameters_or_fail(cand))
+            graph._register()
+            return graph, {'mutation': 'layerchoice', 'label': module.label, 'candidates': candidate_name_list}
         elif original_type_name == OpTypeName.InputChoice:
             m_attrs = self._handle_inputchoice(module)
         elif original_type_name == OpTypeName.ValueChoice:
@@ -629,6 +641,16 @@ class GraphConverter:
         self.refine_graph(ir_graph)
 
         ir_graph._register()
+
+        # add mutation signal for special modules
+        if original_type_name == OpTypeName.Repeat:
+            attrs = {
+                'mutation': 'repeat',
+                'label': module.label,
+                'min_depth': module.min_depth,
+                'max_depth': module.max_depth
+            }
+            return ir_graph, attrs
 
         return ir_graph, {}
 

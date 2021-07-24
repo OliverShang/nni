@@ -11,7 +11,6 @@
 /ts/nni_manager/metrics.json
 /ts/nni_manager/trial_jobs.json
 
-
 # Logs
 logs
 *.log
@@ -33,6 +32,12 @@ lib-cov
 
 # Coverage directory used by tools like istanbul
 coverage
+junit/
+coverage.xml
+test-*.xml
+.coverage.*
+htmlcov/
+.coverage
 
 # nyc test coverage
 .nyc_output

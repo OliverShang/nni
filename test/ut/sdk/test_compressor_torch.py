@@ -61,9 +61,8 @@ class CompressorTestCase(TestCase):
 
     def test_torch_level_pruner(self):
         model = TorchModel()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
         configure_list = [{'sparsity': 0.8, 'op_types': ['default']}]
-        torch_pruner.LevelPruner(model, configure_list, optimizer).compress()
+        torch_pruner.LevelPruner(model, configure_list).compress()
 
     def test_torch_naive_quantizer(self):
         model = TorchModel()
@@ -93,7 +92,7 @@ class CompressorTestCase(TestCase):
 
         model = TorchModel()
         config_list = [{'sparsity': 0.6, 'op_types': ['Conv2d']}, {'sparsity': 0.2, 'op_types': ['Conv2d']}]
-        pruner = torch_pruner.FPGMPruner(model, config_list, torch.optim.SGD(model.parameters(), lr=0.01))
+        pruner = torch_pruner.FPGMPruner(model, config_list)
 
         model.conv2.module.weight.data = torch.tensor(w).float()
         masks = pruner.calc_mask(model.conv2)
@@ -152,7 +151,7 @@ class CompressorTestCase(TestCase):
         config_list = [{'sparsity': 0.2, 'op_types': ['BatchNorm2d']}]
         model.bn1.weight.data = torch.tensor(w).float()
         model.bn2.weight.data = torch.tensor(-w).float()
-        pruner = torch_pruner.SlimPruner(model, config_list)
+        pruner = torch_pruner.SlimPruner(model, config_list, optimizer=None, trainer=None, criterion=None)
 
         mask1 = pruner.calc_mask(model.bn1)
         mask2 = pruner.calc_mask(model.bn2)
@@ -165,7 +164,7 @@ class CompressorTestCase(TestCase):
         config_list = [{'sparsity': 0.6, 'op_types': ['BatchNorm2d']}]
         model.bn1.weight.data = torch.tensor(w).float()
         model.bn2.weight.data = torch.tensor(w).float()
-        pruner = torch_pruner.SlimPruner(model, config_list)
+        pruner = torch_pruner.SlimPruner(model, config_list, optimizer=None, trainer=None, criterion=None)
 
         mask1 = pruner.calc_mask(model.bn1)
         mask2 = pruner.calc_mask(model.bn2)
@@ -202,8 +201,8 @@ class CompressorTestCase(TestCase):
 
         model = TorchModel()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
-        pruner = torch_pruner.TaylorFOWeightFilterPruner(model, config_list, optimizer, statistics_batch_num=1)
-        
+        pruner = torch_pruner.TaylorFOWeightFilterPruner(model, config_list, optimizer, trainer=None, criterion=None, sparsifying_training_batches=1)
+
         x = torch.rand((1, 1, 28, 28), requires_grad=True)
         model.conv1.module.weight.data = torch.tensor(w1).float()
         model.conv2.module.weight.data = torch.tensor(w2).float()
@@ -219,6 +218,50 @@ class CompressorTestCase(TestCase):
         mask2 = pruner.calc_mask(model.conv2)
         assert all(torch.sum(mask1['weight_mask'], (1, 2, 3)).numpy() == np.array([0., 25., 25., 25., 25.]))
         assert all(torch.sum(mask2['weight_mask'], (1, 2, 3)).numpy() == np.array([125., 125., 125., 125., 0., 0., 0., 0., 0., 0., ]))
+
+    def test_torch_taylorFOweight_pruner_global_sort(self):
+        """
+        After enabling global_sort, taylorFOweight pruner will calculate contributions and rank topk from all
+        of the conv operators. Then it will prune low contribution filters depends on the global information.
+
+        So if sparsity of conv operator is 0.4, the expected masks should mask out filter 0 and filter 1 together, 
+        this can be verified through:
+        `all(torch.sum(mask1['weight_mask'], (1, 2, 3)).numpy() == np.array([0., 0., 0, 0., 25.]))`
+        `all(torch.sum(mask2['weight_mask'], (1, 2, 3)).numpy() == np.array([125., 125., 125., 125., 125., 125., 125., 0., 0., 0.]))`
+        """
+
+        w1 = np.array([np.zeros((1, 5, 5)), np.ones((1, 5, 5)), np.ones((1, 5, 5)) * 2,
+                      np.ones((1, 5, 5)) * 3, np.ones((1, 5, 5)) * 4])
+        w2 = np.array([[[[i + 1] * 5] * 5] * 5 for i in range(10)[::-1]])
+
+        grad1 = np.array([np.ones((1, 5, 5)) * -1, np.ones((1, 5, 5)) * 1, np.ones((1, 5, 5)) * -1,
+                      np.ones((1, 5, 5)) * 1, np.ones((1, 5, 5)) * -1])
+
+        grad2 = np.array([[[[(-1)**i] * 5] * 5] * 5 for i in range(10)])
+
+        config_list = [{'sparsity': 0.4, 'op_types': ['Conv2d']}]
+
+        model = TorchModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
+        pruner = torch_pruner.TaylorFOWeightFilterPruner(model, config_list, optimizer, trainer=None, criterion=None, sparsifying_training_batches=1, global_sort=True)
+
+        x = torch.rand((1, 1, 28, 28), requires_grad=True)
+        model.conv1.module.weight.data = torch.tensor(w1).float()
+        model.conv2.module.weight.data = torch.tensor(w2).float()
+
+        y = model(x)
+        y.backward(torch.ones_like(y))
+
+        model.conv1.module.weight.grad.data = torch.tensor(grad1).float()
+        model.conv2.module.weight.grad.data = torch.tensor(grad2).float()
+        optimizer.step()
+
+        mask1 = pruner.calc_mask(model.conv1)
+        mask2 = pruner.calc_mask(model.conv2)
+        print(torch.sum(mask1['weight_mask'], (1, 2, 3)).numpy())
+        print(torch.sum(mask2['weight_mask'], (1, 2, 3)).numpy())
+        assert all(torch.sum(mask1['weight_mask'], (1, 2, 3)).numpy() == np.array([0., 0., 0, 0., 25.]))
+        assert all(torch.sum(mask2['weight_mask'], (1, 2, 3)).numpy() == np.array([125., 125., 125., 125., 125., 125., 125., 0., 0., 0.]))
 
     def test_torch_QAT_quantizer(self):
         model = TorchModel()
@@ -239,15 +282,16 @@ class CompressorTestCase(TestCase):
         # test quantize
         # range not including 0
         eps = 1e-7
+        input = torch.tensor([[0, 4], [2, 1]]).float()
         weight = torch.tensor([[1, 2], [3, 5]]).float()
         model.conv2.module.old_weight.data = weight
-        quantizer.quantize_weight(model.conv2)
+        quantizer.quantize_weight(model.conv2, input_tensor=input)
         assert math.isclose(model.conv2.module.scale, 5 / 255, abs_tol=eps)
         assert model.conv2.module.zero_point == 0
         # range including 0
         weight = torch.tensor([[-1, 2], [3, 5]]).float()
         model.conv2.module.old_weight.data = weight
-        quantizer.quantize_weight(model.conv2)
+        quantizer.quantize_weight(model.conv2, input_tensor=input)
         assert math.isclose(model.conv2.module.scale, 6 / 255, abs_tol=eps)
         assert model.conv2.module.zero_point in (42, 43)
         # test value of weight and bias after quantization
@@ -257,7 +301,7 @@ class CompressorTestCase(TestCase):
         bias_valid = torch.tensor([2.3432, 3.4342, 1.3414, 5.2341])
         model.conv2.module.old_weight.data = weight
         model.conv2.module.bias.data = bias
-        quantizer.quantize_weight(model.conv2)
+        quantizer.quantize_weight(model.conv2, input_tensor=input)
         assert torch.all(torch.isclose(model.conv2.module.weight.data, weight_valid, rtol=1e-4))
         assert torch.all(torch.isclose(model.conv2.module.bias.data, bias_valid, rtol=1e-7))
 
@@ -265,14 +309,63 @@ class CompressorTestCase(TestCase):
         eps = 1e-7
         x = torch.tensor([[-0.2, 0], [0.1, 0.2]])
         out = model.relu(x)
-        assert math.isclose(model.relu.module.tracked_min_biased, 0, abs_tol=eps)
-        assert math.isclose(model.relu.module.tracked_max_biased, 0.002, abs_tol=eps)
+        assert math.isclose(model.relu.module.tracked_min_activation, 0, abs_tol=eps)
+        assert math.isclose(model.relu.module.tracked_max_activation, 0.002, abs_tol=eps)
 
         quantizer.step_with_optimizer()
         x = torch.tensor([[0.2, 0.4], [0.6, 0.8]])
         out = model.relu(x)
-        assert math.isclose(model.relu.module.tracked_min_biased, 0.002, abs_tol=eps)
-        assert math.isclose(model.relu.module.tracked_max_biased, 0.00998, abs_tol=eps)
+        assert math.isclose(model.relu.module.tracked_min_activation, 0.002, abs_tol=eps)
+        assert math.isclose(model.relu.module.tracked_max_activation, 0.00998, abs_tol=eps)
+
+    def test_torch_quantizer_export(self):
+        config_list_qat = [{
+            'quant_types': ['weight'],
+            'quant_bits': 8,
+            'op_types': ['Conv2d', 'Linear']
+        }, {
+            'quant_types': ['output'],
+            'quant_bits': 8,
+            'quant_start_step': 0,
+            'op_types': ['ReLU']
+        }]
+        config_list_dorefa = [{
+            'quant_types': ['weight'],
+            'quant_bits': {
+                'weight': 8,
+            }, # you can just use `int` here because all `quan_types` share same bits length, see config for `ReLu6` below.
+            'op_types':['Conv2d', 'Linear']
+        }]
+        config_list_bnn = [{
+            'quant_types': ['weight'],
+            'quant_bits': 1,
+            'op_types': ['Conv2d', 'Linear']
+        }, {
+            'quant_types': ['output'],
+            'quant_bits': 1,
+            'op_types': ['ReLU']
+        }]
+        config_set = [config_list_qat, config_list_dorefa, config_list_bnn]
+        quantize_algorithm_set = [torch_quantizer.QAT_Quantizer, torch_quantizer.DoReFaQuantizer, torch_quantizer.BNNQuantizer]
+
+        for config, quantize_algorithm in zip(config_set, quantize_algorithm_set):
+            model = TorchModel()
+            model.relu = torch.nn.ReLU()
+            quantizer = quantize_algorithm(model, config)
+            quantizer.compress()
+
+            x = torch.rand((1, 1, 28, 28), requires_grad=True)
+            y = model(x)
+            y.backward(torch.ones_like(y))
+
+            model_path = "test_model.pth"
+            calibration_path = "test_calibration.pth"
+            onnx_path = "test_model.onnx"
+            input_shape = (1, 1, 28, 28)
+            device = torch.device("cpu")
+
+            calibration_config = quantizer.export_model(model_path, calibration_path, onnx_path, input_shape, device)
+            assert calibration_config is not None
 
     def test_torch_pruner_validation(self):
         # test bad configuraiton
@@ -295,7 +388,7 @@ class CompressorTestCase(TestCase):
             ],
             [
                 {'sparsity': 0.2 },
-                {'sparsity': 0.6, 'op_names': 'abc' }
+                {'sparsity': 0.6, 'op_names': 'abc'}
             ]
         ]
         model = TorchModel()
@@ -303,7 +396,13 @@ class CompressorTestCase(TestCase):
         for pruner_class in pruner_classes:
             for config_list in bad_configs:
                 try:
-                    pruner_class(model, config_list, optimizer)
+                    kwargs = {}
+                    if pruner_class in (torch_pruner.SlimPruner, torch_pruner.AGPPruner, torch_pruner.ActivationMeanRankFilterPruner, torch_pruner.ActivationAPoZRankFilterPruner):
+                        kwargs = {'optimizer': None, 'trainer': None, 'criterion': None}
+
+                    print('kwargs', kwargs)
+                    pruner_class(model, config_list, **kwargs)      
+
                     print(config_list)
                     assert False, 'Validation error should be raised for bad configuration'
                 except schema.SchemaError:

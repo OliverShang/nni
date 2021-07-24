@@ -8,7 +8,6 @@ from . import default_layers
 
 _logger = logging.getLogger(__name__)
 
-
 class LayerInfo:
     def __init__(self, name, module):
         self.module = module
@@ -20,7 +19,6 @@ def _setattr(model, name, module):
     for name in name_list[:-1]:
         model = getattr(model, name)
     setattr(model, name_list[-1], module)
-
 
 class Compressor:
     """
@@ -236,7 +234,6 @@ class Compressor:
         """
         raise NotImplementedError()
 
-
     def add_activation_collector(self, collector):
         self._fwd_hook_id += 1
         self._fwd_hook_handles[self._fwd_hook_id] = []
@@ -260,6 +257,18 @@ class Compressor:
                 # calculate mask
                 for task in tasks:
                     task()
+                return output
+            return new_step
+        if self.optimizer is not None:
+            self.optimizer.step = types.MethodType(patch_step(self.optimizer.step), self.optimizer)
+
+    def patch_optimizer_before(self, *tasks):
+        def patch_step(old_step):
+            def new_step(_, *args, **kwargs):
+                for task in tasks:
+                    task()
+                # call origin optimizer step method
+                output = old_step(*args, **kwargs)
                 return output
             return new_step
         if self.optimizer is not None:
@@ -320,8 +329,6 @@ class Pruner(Compressor):
 
     def __init__(self, model, config_list, optimizer=None):
         super().__init__(model, config_list, optimizer)
-        if optimizer is not None:
-            self.patch_optimizer(self.update_mask)
 
     def compress(self):
         self.update_mask()
@@ -387,7 +394,7 @@ class Pruner(Compressor):
         """
         assert model_path is not None, 'model_path must be specified'
         mask_dict = {}
-        self._unwrap_model() # used for generating correct state_dict name without wrapper state
+        self._unwrap_model()  # used for generating correct state_dict name without wrapper state
 
         for wrapper in self.get_modules_wrapper():
             weight_mask = wrapper.weight_mask
@@ -434,6 +441,27 @@ class Pruner(Compressor):
         else:
             self.bound_model.load_state_dict(model_state)
 
+    def get_pruned_weights(self, dim=0):
+        """
+        Log the simulated prune sparsity.
+
+        Parameters
+        ----------
+        dim : int
+            the pruned dim.
+        """
+        for _, wrapper in enumerate(self.get_modules_wrapper()):
+            weight_mask = wrapper.weight_mask
+            mask_size = weight_mask.size()
+            if len(mask_size) == 1:
+                index = torch.nonzero(weight_mask.abs() != 0).tolist()
+            else:
+                sum_idx = list(range(len(mask_size)))
+                sum_idx.remove(dim)
+                index = torch.nonzero(weight_mask.abs().sum(sum_idx) != 0).tolist()
+            _logger.info(f'simulated prune {wrapper.name} remain/total: {len(index)}/{weight_mask.size(dim)}')
+
+
 class QuantizerModuleWrapper(torch.nn.Module):
     def __init__(self, module, module_name, module_type, config, quantizer):
         """
@@ -475,26 +503,27 @@ class QuantizerModuleWrapper(torch.nn.Module):
 
     def forward(self, *inputs):
         if 'input' in self.config['quant_types']:
-            inputs = self.quantizer.quant_grad.apply(
+            inputs = self.quantizer.quant_grad(
                 inputs,
                 QuantType.QUANT_INPUT,
                 self)
 
         if 'weight' in self.config['quant_types'] and _check_weight(self.module):
-            self.quantizer.quant_grad.apply(
+            self.quantizer.quant_grad(
                 self.module.old_weight,
                 QuantType.QUANT_WEIGHT,
-                self)
+                self, inputs[0])
             result = self.module(*inputs)
         else:
             result = self.module(*inputs)
 
         if 'output' in self.config['quant_types']:
-            result = self.quantizer.quant_grad.apply(
+            result = self.quantizer.quant_grad(
                 result,
                 QuantType.QUANT_OUTPUT,
                 self)
         return result
+
 
 class Quantizer(Compressor):
     """
@@ -503,7 +532,7 @@ class Quantizer(Compressor):
 
     def __init__(self, model, config_list, optimizer=None):
         super().__init__(model, config_list, optimizer)
-        self.quant_grad = QuantGrad
+        self.quant_grad = QuantGrad.apply
         if self.optimizer is not None:
             self.patch_optimizer(self.step_with_optimizer)
             for wrapper in self.get_modules_wrapper():
@@ -512,14 +541,12 @@ class Quantizer(Compressor):
                     # and it is trainable, therefore, it should be added to optimizer.
                     self.optimizer.add_param_group({"params": wrapper.module.old_weight})
 
-    def quantize_weight(self, weight, wrapper, **kwargs):
+    def quantize_weight(self, wrapper, **kwargs):
         """
         quantize should overload this method to quantize weight.
         This method is effectively hooked to :meth:`forward` of the model.
         Parameters
         ----------
-        weight : Tensor
-            weight that needs to be quantized
         wrapper : QuantizerModuleWrapper
             the wrapper for origin module
         """
@@ -551,7 +578,6 @@ class Quantizer(Compressor):
         """
         raise NotImplementedError('Quantizer must overload quantize_input()')
 
-
     def _wrap_modules(self, layer, config):
         """
         Create a wrapper forward function to replace the original one.
@@ -572,6 +598,67 @@ class Quantizer(Compressor):
                 assert quant_type in config['quant_bits'], 'bits length for %s must be specified in quant_bits dict' % quant_type
 
         return QuantizerModuleWrapper(layer.module, layer.name, layer.type, config, self)
+
+    def export_model_save(self, model, model_path, calibration_config=None, calibration_path=None, onnx_path=None,
+                          input_shape=None, device=None):
+        """
+        This method helps save pytorch model, calibration config, onnx model in quantizer.
+
+        Parameters
+        ----------
+        model : pytorch model
+            pytorch model to be saved
+        model_path : str
+            path to save pytorch
+        calibration_config: dict
+            (optional) config of calibration parameters
+        calibration_path : str
+            (optional) path to save quantize parameters after calibration
+        onnx_path : str
+            (optional) path to save onnx model
+        input_shape : list or tuple
+            input shape to onnx model
+        device : torch.device
+            device of the model, used to place the dummy input tensor for exporting onnx file.
+            the tensor is placed on cpu if ```device``` is None
+        """
+        torch.save(model.state_dict(), model_path)
+        _logger.info('Model state_dict saved to %s', model_path)
+        if calibration_path is not None:
+            torch.save(calibration_config, calibration_path)
+            _logger.info('Mask dict saved to %s', calibration_path)
+        if onnx_path is not None:
+            assert input_shape is not None, 'input_shape must be specified to export onnx model'
+            # input info needed
+            if device is None:
+                device = torch.device('cpu')
+            input_data = torch.Tensor(*input_shape)
+            torch.onnx.export(self.bound_model, input_data.to(device), onnx_path)
+            _logger.info('Model in onnx with input shape %s saved to %s', input_data.shape, onnx_path)
+
+    def export_model(self, model_path, calibration_path=None, onnx_path=None, input_shape=None, device=None):
+        """
+        Export quantized model weights and calibration parameters
+
+        Parameters
+        ----------
+        model_path : str
+            path to save quantized model weight
+        calibration_path : str
+            (optional) path to save quantize parameters after calibration
+        onnx_path : str
+            (optional) path to save onnx model
+        input_shape : list or tuple
+            input shape to onnx model
+        device : torch.device
+            device of the model, used to place the dummy input tensor for exporting onnx file.
+            the tensor is placed on cpu if ```device``` is None
+
+        Returns
+        -------
+        Dict
+        """
+        raise NotImplementedError('Quantizer must overload export_model()')
 
     def step_with_optimizer(self):
         pass
@@ -612,6 +699,7 @@ class QuantGrad(torch.autograd.Function):
             quantized x without clamped
         """
         return ((x / scale) + zero_point).round()
+
     @classmethod
     def get_bits_length(cls, config, quant_type):
         """
@@ -644,8 +732,8 @@ class QuantGrad(torch.autograd.Function):
         grad_output : Tensor
             gradient of the output of quantization operation
         scale : Tensor
-            the type of quantization, it can be `QuantType.QUANT_INPUT`, `QuantType.QUANT_WEIGHT`, `QuantType.QUANT_OUTPUT`,
-            you can define different behavior for different types.
+            the type of quantization, it can be `QuantType.QUANT_INPUT`, `QuantType.QUANT_WEIGHT`,
+            `QuantType.QUANT_OUTPUT`, you can define different behavior for different types.
         zero_point : Tensor
             zero_point for quantizing tensor
         qmin : Tensor
@@ -660,16 +748,8 @@ class QuantGrad(torch.autograd.Function):
         return grad_output
 
     @staticmethod
-    def forward(ctx, tensor, quant_type, wrapper, **kwargs):
-        if quant_type == QuantType.QUANT_INPUT:
-            output = wrapper.quantizer.quantize_input(tensor, wrapper, **kwargs)
-        elif quant_type == QuantType.QUANT_WEIGHT:
-            output = wrapper.quantizer.quantize_weight(wrapper, **kwargs)
-        elif quant_type == QuantType.QUANT_OUTPUT:
-            output = wrapper.quantizer.quantize_output(tensor, wrapper, **kwargs)
-        else:
-            raise ValueError("unrecognized QuantType.")
-
+    def forward(ctx, tensor, quant_type, wrapper, input_tensor=None, **kwargs):
+        output = quantize_helper(tensor, quant_type, wrapper, input_tensor, **kwargs)
 
         bits = QuantGrad.get_bits_length(wrapper.config, QType_Dict[quant_type])
         qmin, qmax = torch.Tensor([0]).to(tensor.device), torch.Tensor([(1 << bits) - 1]).to(tensor.device)
@@ -692,3 +772,24 @@ def _check_weight(module):
         return isinstance(module.weight.data, torch.Tensor)
     except AttributeError:
         return False
+
+def quantize_helper(tensor, quant_type, wrapper, input_tensor=None, **kwargs):
+    if quant_type == QuantType.QUANT_INPUT:
+        output = wrapper.quantizer.quantize_input(*tensor, wrapper=wrapper, **kwargs)
+    elif quant_type == QuantType.QUANT_WEIGHT:
+        output = wrapper.quantizer.quantize_weight(wrapper, input_tensor=input_tensor, **kwargs)
+    elif quant_type == QuantType.QUANT_OUTPUT:
+        output = wrapper.quantizer.quantize_output(tensor, wrapper, **kwargs)
+    else:
+        raise ValueError("unrecognized QuantType.")
+
+    return output
+
+class QuantForward(torch.nn.Module):
+    """
+    Base class for executing quantization operations. This is for quantization algorithms
+    that do not need to customize gradient.
+    """
+
+    def forward(self, tensor, quant_type, wrapper, input_tensor=None, **kwargs):
+        return quantize_helper(tensor, quant_type, wrapper, input_tensor, **kwargs)
